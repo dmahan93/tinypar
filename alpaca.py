@@ -378,7 +378,13 @@ def model_provider_func(llama_args, *args, **kwargs):
 
 def loss_func(pred, label):
     label = rearrange(label, "b s -> s b").contiguous()
-    loss = tensor_parallel.vocab_parallel_cross_entropy(pred, label).mean()
+    # logits = rearrange(pred, "s b n -> b n s").contiguous()
+    logits = tensor_parallel.gather_from_tensor_model_parallel_region(
+        pred
+    )
+    # loss = tensor_parallel.vocab_parallel_cross_entropy(pred, label).mean()
+    print(label.shape, logits.shape)
+    loss = F.cross_entropy(logits.view(-1, logits.shape[-1]).contiguous(), label.view(-1).contiguous())
     averaged_loss = average_losses_across_data_parallel_group([loss])
     return loss, {"nice_loss": averaged_loss}
 
@@ -510,15 +516,15 @@ def packed_dataset(tokenizer, dataset: str, num_passes: int = 4):
                 prompt = [1] + tokenizer.encode(prompt)  # add bos first...
                 output = tokenizer.encode(output)
                 input = prompt + output + [2]
-                mask = [-1 for _ in range(len(prompt) - 1)] + output + [2]
+                mask = [-100 for _ in range(len(prompt) - 1)] + output + [2]
                 if len(prompt) < 2000:
                     turns.append([input, mask])
                     if len(turns[-1][0]) < 2048:
                         turns[-1][0].extend([0 for _ in range(ModelArgs.max_seq_len - len(turns[-1][0]))])
-                        turns[-1][1].extend([-1 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
+                        turns[-1][1].extend([-100 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
                     elif len(turns[-1][1]) < 2048:
                         # Since it's one less, could and has hit 2047 exactly here, ask me how I know -_-
-                        turns[-1][1].extend([-1 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
+                        turns[-1][1].extend([-100 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
                     elif len(turns[-1][0]) > 2048:
                         turns[-1][0] = turns[-1][0][:2048]
                         turns[-1][1] = turns[-1][1][:2048]
