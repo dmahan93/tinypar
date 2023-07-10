@@ -41,7 +41,7 @@ def identity(x):
     return x
 
 
-# torch.compile = identity
+torch.compile = identity
 torch._dynamo.config.cache_size_limit = 100
 
 SP = True
@@ -563,8 +563,8 @@ def sample_random_chunks(data, chunk_size, batch_size, global_batch_size, dp_ran
         )
         yield chunks
         i += global_batch_size
-        if i > data_len - batch_size:
-            i = 0
+        if i >= data_len - batch_size:
+            i = batch_size * dp_rank
 
 
 def inference(models, tok, texts: list[str], llama_args: ModelArgs, micro_batch_size: int, rank: int,
@@ -830,7 +830,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
     try:
-        state_dict = torch.load(llama / f"consolidated.{tp_rank:02d}.pth")
+        state_dict = torch.load(llama / f"consolidated.{tp_rank:02d}.pth", map_location=torch.device('cpu'))
         state_dict = convert_llama_state_dict(
             llama_args,
             state_dict,
