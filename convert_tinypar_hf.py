@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Updates to support pipeline parallelism in TinyPar, as well as the differences in the model architecture
 import argparse
 import gc
 import json
@@ -111,14 +113,16 @@ def write_model(model_path, input_base_path, model_size, num_pp):
     else:
         # Sharded
         loaded = [[
-            torch.load(os.path.join(input_base_path, f"consolidated.{i:02d}.{j:02d}.pth"), map_location="cpu")
+            torch.load(os.path.join(input_base_path, f"tp-consolidated.{i:02d}.{j:02d}.pth"), map_location="cpu")
             for i in range(num_shards)
         ] for j in range(num_pp)]
     param_count = 0
     index_dict = {"weight_map": {}}
+    layers_per_pp = n_layers // num_pp
     for layer_i in range(n_layers):
         filename = f"pytorch_model-{layer_i + 1}-of-{n_layers + 1}.bin"
-        pp_index = layer_i // (n_layers // num_pp)
+        pp_index = layer_i // layers_per_pp
+        pp_layer_i = layer_i % layers_per_pp
         if model_size == "7B":
             raise NotImplementedError("7B is not supported yet.")
             # Unsharded
@@ -142,19 +146,19 @@ def write_model(model_path, input_base_path, model_size, num_pp):
             # Note that attention.w{q,k,v,o}, feed_fordward.w[1,2,3], attention_norm.weight and ffn_norm.weight share
             # the same storage object, saving attention_norm and ffn_norm will save other weights too, which is
             # redundant as other weights will be stitched from multiple shards. To avoid that, they are cloned.
-
+            print(pp_index, pp_layer_i, layer_i)
             state_dict = {
-                f"model.layers.{layer_i}.input_layernorm.weight": loaded[0][pp_index][
-                    f"module.wrapped.layers.{layer_i}.attention_norm.weight"
+                f"model.layers.{layer_i}.input_layernorm.weight": loaded[pp_index][0][
+                    f"module.wrapped.layers.{pp_layer_i}.attention_norm.weight"
                 ].clone(),
-                f"model.layers.{layer_i}.post_attention_layernorm.weight": loaded[0][pp_index][
-                    f"module.wrapped.layers.{layer_i}.ffn_norm.weight"
+                f"model.layers.{layer_i}.post_attention_layernorm.weight": loaded[pp_index][0][
+                    f"module.wrapped.layers.{pp_layer_i}.ffn_norm.weight"
                 ].clone(),
             }
             state_dict[f"model.layers.{layer_i}.self_attn.q_proj.weight"] = permute(
                 torch.cat(
                     [
-                        loaded[i][pp_index][f"module.wrapped.layers.{layer_i}.attention.wq.weight"].view(n_heads_per_shard, dims_per_head, dim)
+                        loaded[pp_index][i][f"module.wrapped.layers.{pp_layer_i}.attention.wq.weight"].view(n_heads_per_shard, dims_per_head, dim)
                         for i in range(num_shards)
                     ],
                     dim=0,
@@ -163,7 +167,7 @@ def write_model(model_path, input_base_path, model_size, num_pp):
             state_dict[f"model.layers.{layer_i}.self_attn.k_proj.weight"] = permute(
                 torch.cat(
                     [
-                        loaded[i][pp_index][f"module.wrapped.layers.{layer_i}.attention.wk.weight"].view(n_heads_per_shard, dims_per_head, dim)
+                        loaded[pp_index][i][f"module.wrapped.layers.{pp_layer_i}.attention.wk.weight"].view(n_heads_per_shard, dims_per_head, dim)
                         for i in range(num_shards)
                     ],
                     dim=0,
@@ -171,23 +175,23 @@ def write_model(model_path, input_base_path, model_size, num_pp):
             )
             state_dict[f"model.layers.{layer_i}.self_attn.v_proj.weight"] = torch.cat(
                 [
-                    loaded[i][pp_index][f"module.wrapped.layers.{layer_i}.attention.wv.weight"].view(n_heads_per_shard, dims_per_head, dim)
+                    loaded[pp_index][i][f"module.wrapped.layers.{pp_layer_i}.attention.wv.weight"].view(n_heads_per_shard, dims_per_head, dim)
                     for i in range(num_shards)
                 ],
                 dim=0,
             ).reshape(dim, dim)
 
             state_dict[f"model.layers.{layer_i}.self_attn.o_proj.weight"] = torch.cat(
-                [loaded[i][pp_index][f"module.wrapped.layers.{layer_i}.attention.wo.weight"] for i in range(num_shards)], dim=1
+                [loaded[pp_index][i][f"module.wrapped.layers.{pp_layer_i}.attention.wo.weight"] for i in range(num_shards)], dim=1
             )
             state_dict[f"model.layers.{layer_i}.mlp.gate_proj.weight"] = torch.cat(
-                [loaded[i][pp_index][f"module.wrapped.layers.{layer_i}.feed_forward.w1.weight"] for i in range(num_shards)], dim=0
+                [loaded[pp_index][i][f"module.wrapped.layers.{pp_layer_i}.feed_forward.w1.weight"] for i in range(num_shards)], dim=0
             )
             state_dict[f"model.layers.{layer_i}.mlp.down_proj.weight"] = torch.cat(
-                [loaded[i][pp_index][f"module.wrapped.layers.{layer_i}.feed_forward.w2.weight"] for i in range(num_shards)], dim=1
+                [loaded[pp_index][i][f"module.wrapped.layers.{pp_layer_i}.feed_forward.w2.weight"] for i in range(num_shards)], dim=1
             )
             state_dict[f"model.layers.{layer_i}.mlp.up_proj.weight"] = torch.cat(
-                [loaded[i][pp_index][f"module.wrapped.layers.{layer_i}.feed_forward.w3.weight"] for i in range(num_shards)], dim=0
+                [loaded[pp_index][i][f"module.wrapped.layers.{pp_layer_i}.feed_forward.w3.weight"] for i in range(num_shards)], dim=0
             )
 
         state_dict[f"model.layers.{layer_i}.self_attn.rotary_emb.inv_freq"] = inv_freq
@@ -207,11 +211,11 @@ def write_model(model_path, input_base_path, model_size, num_pp):
         # }
     else:
         state_dict = {
-            "model.norm.weight": loaded[0][-1]["module.wrapped.norm.weight"],
+            "model.norm.weight": loaded[-1][0]["module.wrapped.norm.weight"],
             "model.embed_tokens.weight": torch.cat(
-                [loaded[i][0]["module.wrapped.tok_embeddings.weight"] for i in range(num_shards)], dim=0
+                [loaded[0][i]["module.wrapped.tok_embeddings.weight"] for i in range(num_shards)], dim=0
             ),
-            "lm_head.weight": torch.cat([loaded[i][-1]["module.wrapped.output.weight"] for i in range(num_shards)], dim=0),
+            "lm_head.weight": torch.cat([loaded[-1][i]["module.wrapped.output.weight"] for i in range(num_shards)], dim=0),
         }
 
     for k, v in state_dict.items():
@@ -275,6 +279,7 @@ def main():
     parser.add_argument(
         "--num_pp",
         help="Number of Pipeline Parallelism shards",
+        type=int,
     )
     args = parser.parse_args()
     write_model(
