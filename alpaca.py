@@ -7,6 +7,7 @@ from typing import List, Tuple, Optional
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from socket import gethostname
+import pickle
 
 from einops import rearrange
 
@@ -383,7 +384,7 @@ def loss_func(pred, label):
         pred
     )
     # loss = tensor_parallel.vocab_parallel_cross_entropy(pred, label).mean()
-    print(label.shape, logits.shape)
+    # print(label.shape, logits.shape)
     loss = F.cross_entropy(logits.view(-1, logits.shape[-1]).contiguous(), label.view(-1).contiguous())
     averaged_loss = average_losses_across_data_parallel_group([loss])
     return loss, {"nice_loss": averaged_loss}
@@ -502,8 +503,8 @@ def preprocess(instruction: str, input: str, output: str):
         return [prompt, output]
 
 
-def packed_dataset(tokenizer, dataset: str, num_passes: int = 4):
-    cache = Path(f"{dataset.replace('/', '--')}.json")
+def packed_dataset(tokenizer, dataset: str, num_passes: int = 1):
+    cache = Path(f"{dataset.replace('/', '--')}.pkl")
     # if cache.exists():
     #    with open(cache) as f:
     #        return json.load(f)
@@ -543,11 +544,11 @@ def packed_dataset(tokenizer, dataset: str, num_passes: int = 4):
             #             turns.append([input, mask])
         print(f"Saving {dataset} to {cache}")
         shuffle(turns)
-        with open(cache, "w") as f:
-            json.dump(turns, f)
+        with open(cache, "wb") as f:
+            pickle.dump(turns, f)
     torch.distributed.barrier()
-    with open(cache) as f:
-        return json.load(f)
+    with open(cache, 'rb') as f:
+        return pickle.load(f)
 
 
 def sample_random_chunks(data, chunk_size, batch_size, global_batch_size, dp_rank):
@@ -558,13 +559,13 @@ def sample_random_chunks(data, chunk_size, batch_size, global_batch_size, dp_ran
     i = batch_size * dp_rank
     while True:
         chunks = (
-            torch.stack([torch.from_numpy(np.array(data[i][0]).copy().astype(np.int64)) for i in range(i, i + batch_size)]),
-            torch.stack([torch.from_numpy(np.array(data[i][1]).copy().astype(np.int64)) for i in range(i, i + batch_size)]),
+            torch.stack([torch.from_numpy(np.array(data[i % data_len][0]).copy().astype(np.int64)) for i in range(i, i + batch_size)]),
+            torch.stack([torch.from_numpy(np.array(data[i % data_len][1]).copy().astype(np.int64)) for i in range(i, i + batch_size)]),
         )
         yield chunks
         i += global_batch_size
-        if i >= data_len - batch_size:
-            i = batch_size * dp_rank
+        if i > data_len:
+            i = i - data_len
 
 
 def inference(models, tok, texts: list[str], llama_args: ModelArgs, micro_batch_size: int, rank: int,
@@ -846,8 +847,8 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
 
     torch.backends.cudnn.benchmark = True
 
-    global_batch_size = 64
-    micro_batch_size = 2
+    global_batch_size = 512
+    micro_batch_size = 1
 
     setup_microbatch_calculator(
         rank=rank,
@@ -926,10 +927,10 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
 
     dt = time.time() - t
 
-    data = packed_dataset(tok, "CarperAI/orca-chatgpt-50k-llm-leaderboard-filtered")
+    data = packed_dataset(tok, "CarperAI/orca-chatgpt-500k-cleaned")
 
     rank_batch = global_batch_size // data_parallel_size
-    total_samples = len(data)
+    total_samples = 4*len(data)
     print(f"{total_samples=}", flush=True)
     total_steps = total_samples // global_batch_size
     step = 0
@@ -938,6 +939,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
         wandb.define_metric("num_tokens")
         wandb.define_metric("loss", step_metric="num_tokens")
     lr = 0.0
+    true_time = time.time()
     for batch in sample_random_chunks(data, llama_args.max_seq_len + 1, rank_batch, global_batch_size, dp_rank):
         optimizer.zero_grad()
         inputs, labels = batch[0].to(local_rank), batch[1].to(local_rank)
@@ -956,8 +958,10 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
         num_tokens += inputs.numel() * data_parallel_size
 
         dt = time.time() - t
+        tdt = time.time() - true_time
         if rank == (world_size - 1):
-            print(f"step {step}/{total_steps}", flush=True)
+            print(f"step {step}/{total_steps}, est to completion: {tdt * (total_steps-step)}", flush=True)
+            true_time = time.time()
             print(f"tflops: {approx_model_flops / (dt * world_size) / 1e12=}", flush=True)
             memory_usage_gb = torch.cuda.max_memory_allocated() / 1e9
             print(f"memory usage: {memory_usage_gb=}", flush=True)
@@ -1020,7 +1024,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
         # LR Schedule
         warmup = min(1.0, step / 100.0)
         cos_anneal = 0.5 * (np.cos(np.pi * step / total_steps) + 1)
-        lr = 2e-5 * warmup * (0.1 + 0.9 * cos_anneal)
+        lr = 3e-5 * warmup * (0.1 + 0.9 * cos_anneal)
         for group in optimizer.param_groups:
             group['lr'] = lr
 

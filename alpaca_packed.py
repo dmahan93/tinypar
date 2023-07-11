@@ -7,6 +7,7 @@ from typing import List, Tuple, Optional
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from socket import gethostname
+import pickle
 
 from einops import rearrange
 
@@ -14,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.distributed
 import torch.nn.functional as F
+from random import shuffle
 
 from apex.transformer import parallel_state
 from apex.transformer import tensor_parallel
@@ -40,7 +42,7 @@ def identity(x):
     return x
 
 
-# torch.compile = identity
+torch.compile = identity
 torch._dynamo.config.cache_size_limit = 100
 
 SP = True
@@ -382,7 +384,7 @@ def loss_func(pred, label):
         pred
     )
     # loss = tensor_parallel.vocab_parallel_cross_entropy(pred, label).mean()
-    print(label.shape, logits.shape)
+    # print(label.shape, logits.shape)
     loss = F.cross_entropy(logits.view(-1, logits.shape[-1]).contiguous(), label.view(-1).contiguous())
     averaged_loss = average_losses_across_data_parallel_group([loss])
     return loss, {"nice_loss": averaged_loss}
@@ -471,7 +473,7 @@ def convert_llama_state_dict(
     }
 
     state_dict = {("module.wrapped." + k): v for k, v in state_dict.items()}
-    state_dict = {k: v.to(map_dtype).cpu() for k, v in state_dict.items()}
+    state_dict = {k: v.to(dtype=map_dtype).cpu() for k, v in state_dict.items()}
     return state_dict
 
 
@@ -483,6 +485,7 @@ import numpy as np
 
 logger = getLogger()
 
+
 def preprocess(instruction: str, input: str, output: str):
     """Build Alpaca prompt and output from instruction and input/output examples"""
     if input:
@@ -491,51 +494,83 @@ def preprocess(instruction: str, input: str, output: str):
             "Write a response that appropriately completes the request."
         )
         prompt = f"{prefix}\n\n### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
-        return prompt + output
+        return [prompt, output]
     else:
         prefix = (
             "Below is an instruction that describes a task. Write a response that appropriately completes the request."
         )
         prompt = f"{prefix}\n\n### Instruction:\n{instruction}\n\n### Response:\n"
-        return prompt + output
-def packed_dataset(tokenizer, dataset: str):
-    cache = Path(f"{dataset}.memap")
-    if cache.exists():
-        return np.memmap(f"{dataset}.memap", dtype=np.uint16, mode="r")
+        return [prompt, output]
 
+
+def packed_dataset(tokenizer, dataset: str, num_passes: int = 4):
+    cache = Path(f"{dataset.replace('/', '--')}_packed.pkl")
+    # if cache.exists():
+    #    with open(cache) as f:
+    #        return json.load(f)
     if torch.distributed.get_rank() == 0:
         ds = load_dataset(dataset, split="train")
-        all_tokens = []
-        for item in tqdm(ds):
-            text = preprocess(item["system"], item["prompt"], item["response"])
-            tokens_batch = [tokenizer.encode(text, add_eos=True)]
-            tokens_batch = [np.array(tokens, dtype=np.uint16) for tokens in tokens_batch]
-            all_tokens.extend(tokens_batch)
-
-        flattened = np.concatenate(all_tokens)
-        print(flattened[:1024])
-        cache.parent.mkdir(parents=True, exist_ok=True)
+        turns = list()
+        for iteration in range(num_passes):
+            for item in tqdm(ds):
+                prompt, output = preprocess(item["system"], item["prompt"], item["response"])
+                prompt = [1] + tokenizer.encode(prompt)  # add bos first...
+                output = tokenizer.encode(output)
+                input = prompt + output + [2]
+                mask = [-100 for _ in range(len(prompt) - 1)] + output + [2]
+                if len(prompt) < 2000:
+                    # turns.append([input, mask])
+                    # if len(turns[-1][0]) < 2048:
+                    #     turns[-1][0].extend([0 for _ in range(ModelArgs.max_seq_len - len(turns[-1][0]))])
+                    #     turns[-1][1].extend([-100 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
+                    # elif len(turns[-1][1]) < 2048:
+                    #     # Since it's one less, could and has hit 2047 exactly here, ask me how I know -_-
+                    #     turns[-1][1].extend([-100 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
+                    # elif len(turns[-1][0]) > 2048:
+                    #     turns[-1][0] = turns[-1][0][:2048]
+                    #     turns[-1][1] = turns[-1][1][:2048]
+                    if len(turns) == 0:
+                        turns.append([input, mask])
+                    else:
+                        if len(turns[-1][0]) + len(input) < ModelArgs.max_seq_len:
+                            turns[-1][0].extend(input)
+                            turns[-1][1].extend([-100] + mask)
+                        else:
+                            if len(turns[-1][1]) == ModelArgs.max_seq_len:
+                                turns.append([input, mask])
+                            elif len(turns[-1][0]) == ModelArgs.max_seq_len:
+                                turns[-1][1].extend([-100 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
+                                turns.append([input, mask])
+                            else:
+                                turns[-1][0].extend([0 for _ in range(ModelArgs.max_seq_len - len(turns[-1][0]))])
+                                turns[-1][1].extend([-100 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
+                                turns.append([input, mask])
+                    turns[-1][0] = turns[-1][0][:2048]
+                    turns[-1][1] = turns[-1][1][:2048]
         print(f"Saving {dataset} to {cache}")
-        memmap = np.memmap(f"{dataset}.memap", dtype=np.uint16, mode="w+", shape=flattened.shape)
-        memmap[:] = flattened[:]
-        memmap.flush()
-        del memmap
+        shuffle(turns)
+        with open(cache, "wb") as f:
+            pickle.dump(turns, f)
     torch.distributed.barrier()
-    flattened = np.memmap(f"{dataset}.memap", dtype=np.uint16, mode="r")
-    print(flattened[:1024])
-    return flattened
+    with open(cache, 'rb') as f:
+        return pickle.load(f)
 
 
-def sample_random_chunks(data, chunk_size, batch_size, seed):
-    generator = torch.Generator()
-    generator.manual_seed(seed)
+def sample_random_chunks(data, chunk_size, batch_size, global_batch_size, dp_rank):
+    # generator = torch.Generator()
+    # generator.manual_seed(seed)
 
     data_len = len(data)
-    chunk_size = min(data_len, chunk_size)
+    i = batch_size * dp_rank
     while True:
-        idxes = torch.randint(0, data_len - chunk_size, (batch_size,), generator=generator)
-        chunks = torch.stack([torch.from_numpy(data[i: i + chunk_size].copy().astype(np.int64)) for i in idxes])
+        chunks = (
+            torch.stack([torch.from_numpy(np.array(data[i][0]).copy().astype(np.int64)) for i in range(i, i + batch_size)]),
+            torch.stack([torch.from_numpy(np.array(data[i][1]).copy().astype(np.int64)) for i in range(i, i + batch_size)]),
+        )
         yield chunks
+        i += global_batch_size
+        if i > data_len - batch_size:
+            i = 0
 
 
 def inference(models, tok, texts: list[str], llama_args: ModelArgs, micro_batch_size: int, rank: int,
@@ -781,7 +816,6 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     data_parallel_size: int = world_size // (
             tensor_model_parallel_size * pipeline_model_parallel_size
     )
-
     tok = SentencePieceProcessor(str(tokenizer))
 
     with open(llama / "params.json") as f:
@@ -802,7 +836,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
     try:
-        state_dict = torch.load(llama / f"consolidated.{tp_rank:02d}.pth")
+        state_dict = torch.load(llama / f"consolidated.{tp_rank:02d}.pth", map_location=torch.device('cpu'))
         state_dict = convert_llama_state_dict(
             llama_args,
             state_dict,
@@ -818,8 +852,8 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
 
     torch.backends.cudnn.benchmark = True
 
-    global_batch_size = 64
-    micro_batch_size = 2
+    global_batch_size = 512
+    micro_batch_size = 1
 
     setup_microbatch_calculator(
         rank=rank,
@@ -859,8 +893,9 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     if distributed_adam:
         optimizer = DistributedFusedAdam(
             models[0].parameters(),
-            lr=1e-5,  # * (global_batch_size / 128),
-            weight_decay=0.1,
+            lr=0.0,  # * (global_batch_size / 128),
+            weight_decay=1e-6,
+            betas=(0.9, 0.95),
             process_group=parallel_state.get_data_parallel_group(),
             dtype=torch.bfloat16,
             # distributed_process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()]),
@@ -897,10 +932,10 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
 
     dt = time.time() - t
 
-    data = packed_dataset(tok, "CarperAI/orca-chatgpt-50k-llm-leaderboard-filtered")
+    data = packed_dataset(tok, "CarperAI/orca-chatgpt-500k-cleaned")
 
     rank_batch = global_batch_size // data_parallel_size
-    total_samples = 1 + (len(data) // llama_args.max_seq_len)
+    total_samples = len(data)
     print(f"{total_samples=}", flush=True)
     total_steps = total_samples // global_batch_size
     step = 0
@@ -908,10 +943,11 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     if rank == (world_size - 1):
         wandb.define_metric("num_tokens")
         wandb.define_metric("loss", step_metric="num_tokens")
-    for batch in sample_random_chunks(data, llama_args.max_seq_len + 1, rank_batch, seed=dp_rank):
+    lr = 0.0
+    true_time = time.time()
+    for batch in sample_random_chunks(data, llama_args.max_seq_len + 1, rank_batch, global_batch_size, dp_rank):
         optimizer.zero_grad()
-        batch = batch.to(local_rank)
-        inputs, labels = batch[:, :-1], batch[:, 1:]
+        inputs, labels = batch[0].to(local_rank), batch[1].to(local_rank)
         t = time.time()
         loss = forward_backward_func(
             train_forward_step_func,
@@ -925,10 +961,11 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
             sequence_parallel_enabled=SP,
         )
         num_tokens += inputs.numel() * data_parallel_size
-
+        tdt = time.time() - true_time
         dt = time.time() - t
         if rank == (world_size - 1):
-            print(f"step {step}/{total_steps}", flush=True)
+            print(f"step {step}/{total_steps}, est to completion: {tdt * (total_steps-step)}", flush=True)
+            true_time = time.time()
             print(f"tflops: {approx_model_flops / (dt * world_size) / 1e12=}", flush=True)
             memory_usage_gb = torch.cuda.max_memory_allocated() / 1e9
             print(f"memory usage: {memory_usage_gb=}", flush=True)
@@ -945,6 +982,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
                 tflops=approx_model_flops / (dt * world_size) / 1e12,
                 num_tokens=num_tokens,
                 tokens_per_sec=inputs.numel() / dt,
+                lr=lr
             ))
 
         # All-reduce RMSNorm grads over sequence dimension
@@ -960,7 +998,6 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
                     rmsnorm_grads, torch._utils._unflatten_dense_tensors(coalesced, rmsnorm_grads)
             ):
                 buf.copy_(synced)
-
         optimizer.step()
 
         if step >= total_steps:
@@ -988,6 +1025,12 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
             torch.distributed.barrier()
 
         step += 1
+        # LR Schedule
+        warmup = min(1.0, step / 100.0)
+        cos_anneal = 0.5 * (np.cos(np.pi * step / total_steps) + 1)
+        lr = 3e-5 * warmup * (0.1 + 0.9 * cos_anneal)
+        for group in optimizer.param_groups:
+            group['lr'] = lr
 
     print("done", flush=True)
     torch.distributed.barrier()
