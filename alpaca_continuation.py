@@ -34,8 +34,6 @@ import wandb
 from tqdm import tqdm
 
 import torch._dynamo
-import warnings
-warnings.filterwarnings("ignore")
 
 torch._dynamo.allow_in_graph(rearrange)
 
@@ -505,8 +503,8 @@ def preprocess(instruction: str, input: str, output: str):
         return [prompt, output]
 
 
-def packed_dataset(tokenizer, dataset: str, num_passes: int = 4):
-    cache = Path(f"{dataset.replace('/', '--')}_packed.pkl")
+def packed_dataset(tokenizer, dataset: str, num_passes: int = 3):
+    cache = Path(f"{dataset.replace('/', '--')}.pkl")
     # if cache.exists():
     #    with open(cache) as f:
     #        return json.load(f)
@@ -521,39 +519,29 @@ def packed_dataset(tokenizer, dataset: str, num_passes: int = 4):
                 input = prompt + output + [2]
                 mask = [-100 for _ in range(len(prompt) - 1)] + output + [2]
                 if len(prompt) < 2000:
-                    # turns.append([input, mask])
-                    # if len(turns[-1][0]) < 2048:
-                    #     turns[-1][0].extend([0 for _ in range(ModelArgs.max_seq_len - len(turns[-1][0]))])
-                    #     turns[-1][1].extend([-100 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
-                    # elif len(turns[-1][1]) < 2048:
-                    #     # Since it's one less, could and has hit 2047 exactly here, ask me how I know -_-
-                    #     turns[-1][1].extend([-100 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
-                    # elif len(turns[-1][0]) > 2048:
-                    #     turns[-1][0] = turns[-1][0][:2048]
-                    #     turns[-1][1] = turns[-1][1][:2048]
-                    if len(turns) == 0:
-                        turns.append([input, mask])
-                    else:
-                        if len(turns[-1][0]) + len(input) <= ModelArgs.max_seq_len:
-                            turns[-1][0].extend(input)
-                            turns[-1][1].extend([-100] + mask)
-                        else:
-                            if len(turns[-1][1]) == ModelArgs.max_seq_len:
-                                turns.append([input, mask])
-                            elif len(turns[-1][0]) == ModelArgs.max_seq_len:
-                                turns[-1][1].extend([-100 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
-                                turns.append([input, mask])
-                            else:
-                                turns[-1][0].extend([0 for _ in range(ModelArgs.max_seq_len - len(turns[-1][0]))])
-                                turns[-1][1].extend([-100 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
-                                turns.append([input, mask])
-                    turns[-1][0] = turns[-1][0][:2048]
-                    turns[-1][1] = turns[-1][1][:2048]
-        if len(turns[-1][0]) < 2048:
-            turns[-1][0].extend([0 for _ in range(ModelArgs.max_seq_len - len(turns[-1][0]))])
-            turns[-1][1].extend([-100 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
-        elif len(turns[-1][1]) < 2048:
-            turns[-1][1].extend([-100 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
+                    turns.append([input, mask])
+                    if len(turns[-1][0]) < 2048:
+                        turns[-1][0].extend([0 for _ in range(ModelArgs.max_seq_len - len(turns[-1][0]))])
+                        turns[-1][1].extend([-100 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
+                    elif len(turns[-1][1]) < 2048:
+                        # Since it's one less, could and has hit 2047 exactly here, ask me how I know -_-
+                        turns[-1][1].extend([-100 for _ in range(ModelArgs.max_seq_len - len(turns[-1][1]))])
+                    elif len(turns[-1][0]) > 2048:
+                        turns[-1][0] = turns[-1][0][:2048]
+                        turns[-1][1] = turns[-1][1][:2048]
+            # if len(turns) == 0:
+            #     turns.append([input, mask])
+            # else:
+            #     if len(turns[-1][0]) + len(input) < ModelArgs.max_seq_len:
+            #         turns[-1][0].extend(input)
+            #         turns[-1][1].extend([-1] + mask)
+            #     else:
+            #         if len(turns[-1][0]) == ModelArgs.max_seq_len:
+            #             turns.append([input, mask])
+            #         else:
+            #             turns[-1][0].extend([tokenizer.pad_token_id] * (ModelArgs.max_seq_len - len(turns[-1][0])))
+            #             turns[-1][1].extend([-1] * (ModelArgs.max_seq_len - len(turns[-1][1])))
+            #             turns.append([input, mask])
         print(f"Saving {dataset} to {cache}")
         shuffle(turns)
         with open(cache, "wb") as f:
@@ -561,6 +549,7 @@ def packed_dataset(tokenizer, dataset: str, num_passes: int = 4):
     torch.distributed.barrier()
     with open(cache, 'rb') as f:
         return pickle.load(f)
+
 
 def sample_random_chunks(data, chunk_size, batch_size, global_batch_size, dp_rank):
     # generator = torch.Generator()
@@ -842,16 +831,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
     try:
-        state_dict = torch.load(llama / f"consolidated.{tp_rank:02d}.pth", map_location=torch.device('cpu'))
-        state_dict = convert_llama_state_dict(
-            llama_args,
-            state_dict,
-            tp_rank,
-            tensor_model_parallel_size,
-            pp_rank,
-            pipeline_model_parallel_size,
-            add_new_tokens=vocab_size - 32000
-        )
+        state_dict = torch.load(llama / f"tp-consolidated.{tp_rank:02d}.{pp_rank:02d}.pth")
     except FileNotFoundError:
         print(f"no checkpoint found")
         state_dict = None
@@ -919,8 +899,6 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     print("constructed opt", flush=True)
     dp_rank = parallel_state.get_data_parallel_rank()
     tp_group = parallel_state.get_tensor_model_parallel_group()
-    dp_group = parallel_state.get_data_parallel_group()
-    print(f"{rank}: dp:{dp_rank}, tp:{tp_rank}, pp: {pp_rank}")
 
     total_params_for_rank = sum(p.numel() for p in models[0].parameters())
     total_params_world = torch.tensor(total_params_for_rank).cuda()
@@ -940,12 +918,12 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
 
     dt = time.time() - t
 
-    data = packed_dataset(tok, "CarperAI/orca-chatgpt-500k-cleaned")
+    data = packed_dataset(tok, "CarperAI/orca-gpt4-100k-cleaned")
 
     rank_batch = global_batch_size // data_parallel_size
     total_samples = len(data)
     print(f"{total_samples=}", flush=True)
-    total_steps = 2#total_samples // global_batch_size
+    total_steps = total_samples // global_batch_size
     step = 0
     num_tokens = 0
     if rank == (world_size - 1):
@@ -1049,6 +1027,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
         torch.save(
             models[0].state_dict(),
             save_to / f"tp-consolidated.{tp_rank:02d}.{pp_rank:02d}.pth",
+
         )
 
     if rank == 0:
